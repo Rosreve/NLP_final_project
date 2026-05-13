@@ -1,0 +1,15 @@
+# Large evidence corpus — keep locally / download separately
+data/
+output/
+
+# Local / secrets
+.env
+.venv/
+
+# Python / OS noise
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Editor / agent logs
+.cursor/*.log
