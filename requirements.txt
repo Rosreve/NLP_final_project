@@ -1,0 +1,10 @@
+numpy
+scikit-learn
+tqdm
+matplotlib
+nltk
+joblib
+sentence-transformers
+torch
+transformers
+accelerate

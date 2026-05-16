@@ -23,20 +23,41 @@ from classifier import TfidfClaimClassifier
 from util import load_data
  
 from retreiver import (TransformerRetreiver, DistilBertReranker, BM25Retreiver, TfidfCharRetreiver, CombinedRetreiver)
- 
+
+
+def str2bool(v):
+    """argparse bool: ``type=bool`` maps any non-empty string to True (e.g. ``bool('False')`` is True)."""
+    if isinstance(v, bool):
+        return v
+    s = v.lower().strip()
+    if s in ("yes", "true", "t", "1", "y"):
+        return True
+    if s in ("no", "false", "f", "0", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected a boolean, got {v!r}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run retrieval + classification pipeline.")
     parser.add_argument(
         "--reranker-top-k",
         type=int,
-        default=50,
+        default=10,
         help="Number of evidence passages to retrieve per claim (eval uses retrieved set as a set).",
     )
     parser.add_argument(
         "--retreiver-top-k",
         type=int,
         default=340,
-        help="Number of evidence passages to retrieve per claim.",
+        help="Number of evidence passages to retrieve per claim.", # usage: python run.py --retreiver-top-k 340
+    )
+    parser.add_argument(
+        "--reranker-retrain",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Retrain the reranker: true or false (default: false).",
     )
     parser.add_argument(
         "--alpha",
@@ -51,10 +72,18 @@ def main():
         help="Beta value for combined retreiver.",
     ) # best 0.3
     parser.add_argument(
-        "--include_reranking",
-        type=bool,
+        "--include-reranking",
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=True,
-        help="Include reranking step.",
+        help="Include reranking step (true/false). Default true.",
+    )
+    parser.add_argument(
+        "--negative-sample-size",
+        type=int,
+        default=50,
+        help="Number of negative samples to use for reranking.",
     )
     args = parser.parse_args()
 
@@ -77,7 +106,7 @@ def main():
     retreived_data: dict = retreiver.retreive_all(dev_claims, visual_sim=False)
 
     if args.include_reranking:
-        ranker = DistilBertReranker(evidence=evidence, retreiver=retreiver, top_k=args.reranker_top_k)
+        ranker = DistilBertReranker(evidence=evidence, retreiver=retreiver, negative_sample_size=args.negative_sample_size, top_k=args.reranker_top_k, retrain=args.reranker_retrain)
         reranked_data: dict = ranker.rerank_all(retreived_data)
     else:
         reranked_data = retreived_data

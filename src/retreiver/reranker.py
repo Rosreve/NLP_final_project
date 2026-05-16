@@ -13,12 +13,29 @@ from transformers import (
 )
 
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 import numpy as np
+
 
 from util import load_data
 from config import OUTPUT_PATH
 
 from joblib import Parallel, delayed
+
+import random
+
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+
+    predictions = np.argmax(logits, axis=-1)
+
+    accuracy = accuracy_score(labels, predictions)
+
+    return {
+        "accuracy": accuracy
+    }
+
 
 class DistilBertReranker:
     def __init__(self,
@@ -27,13 +44,16 @@ class DistilBertReranker:
                 device: str = None,
                 max_length: int = 256,
                 retreiver: TransformerRetreiver = None,
-                top_k: int = 3):
+                negative_sample_size: int = 50,
+                top_k: int = 3,
+                retrain: bool = False):
 
         self.evidence = evidence    
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.max_length = max_length
         self.retreiver = retreiver
+        self.negative_sample_size = negative_sample_size
         self.top_k = top_k
 
         # prepare the training arguments and the trainer
@@ -44,7 +64,7 @@ class DistilBertReranker:
             learning_rate=2e-5, # learning rate for the optimizer
             per_device_train_batch_size=16, # batch size for training
             per_device_eval_batch_size=16, # batch size for validation
-            num_train_epochs=3, # number of training epochs
+            num_train_epochs=1, # number of training epochs
             weight_decay=0.01, # weight decay for the optimizer
             warmup_ratio=0.1, # warmup ratio for the optimizer
             logging_steps=50, # log the training and evaluation metrics every 50 steps
@@ -55,9 +75,10 @@ class DistilBertReranker:
 
         self.model = None
         self.tokenizer = None
-        self._start_fine_tuning(retrain=True)
+        self.retrain = retrain
+        self._start_fine_tuning(retrain=self.retrain)
 
-    def _start_fine_tuning(self, retrain: bool = False):
+    def _start_fine_tuning(self, retrain):
         """
         Start the fine-tuning process. Currenty fine-tuning is "full fine-tuning" of the model, i.e. we do not freeze the model. 
         """
@@ -81,7 +102,8 @@ class DistilBertReranker:
                 model=self.model,
                 args=self.training_args,
                 train_dataset=train_dataset,
-                eval_dataset=val_dataset
+                eval_dataset=val_dataset,
+                compute_metrics=compute_metrics
             )
 
             # start training
@@ -109,10 +131,15 @@ class DistilBertReranker:
                 _train()
 
         if retrain:
+            print("----------------------------------------------------------")
             print("Retraining the model from scratch.")
+            print("----------------------------------------------------------")
             _train()
         else:
+            print("----------------------------------------------------------")
             print("Loading the model and tokenizer from the cache.")
+            print("----------------------------------------------------------")
+ 
             _load()
 
         # set the device
@@ -139,28 +166,57 @@ class DistilBertReranker:
             }
         return reranked_claims
 
-    def rerank(self, claim_text: str, candidate_ids: list) -> list:
+    def rerank(
+        self,
+        claim_text: str,
+        candidate_ids: list,
+        threshold: float = 0.5, # threshold for the confidence score to be considered as positive
+        fallback_top_k: int = 1
+    ) -> list:
         """
-        Rerank a list of evidence IDs for a given claim text.
-        args:
-            claim_text (str): The text of the claim for which we want to rerank the evidence IDs.
-            candidate_ids (list): The list of evidence IDs to rerank.
-            top_k (int): The number of top evidence IDs to return.
-        returns:
-            List of reranked evidence IDs.
+        Return all evidence IDs that the reranker predicts as positive.
+        If none are predicted positive, return the top fallback_top_k evidence(s).
         """
-        # score the evidence pairs
+
         scores: list[float] = self._score_pairs(claim_text, candidate_ids)
 
-        # sort the evidence pairs by the scores
         ranked: list[tuple[str, float]] = sorted(
             zip(candidate_ids, scores),
             key=lambda x: x[1],
-            reverse=True # sort in descending order of scores
+            reverse=True
         )
+
+        positive_ids = [
+            eid for eid, score in ranked
+            if score >= threshold
+        ]
+
+        if len(positive_ids) == 0:
+            return [eid for eid, score in ranked[:fallback_top_k]] # to ensure at least fallback_top_k evidence(s) are returned
+
+        return positive_ids
+    # def rerank(self, claim_text: str, candidate_ids: list) -> list:
+    #     """
+    #     Rerank a list of evidence IDs for a given claim text.
+    #     args:
+    #         claim_text (str): The text of the claim for which we want to rerank the evidence IDs.
+    #         candidate_ids (list): The list of evidence IDs to rerank.
+    #         top_k (int): The number of top evidence IDs to return.
+    #     returns:
+    #         List of reranked evidence IDs.
+    #     """
+    #     # score the evidence pairs
+    #     scores: list[float] = self._score_pairs(claim_text, candidate_ids)
+
+    #     # sort the evidence pairs by the scores
+    #     ranked: list[tuple[str, float]] = sorted(
+    #         zip(candidate_ids, scores),
+    #         key=lambda x: x[1],
+    #         reverse=True # sort in descending order of scores
+    #     )
         
-        # return the top k evidence IDs
-        return [eid for eid, score in ranked[:self.top_k]]
+    #     # return the top k evidence IDs
+    #     return [eid for eid, score in ranked[:self.top_k]]
 
     def _score_pairs(self, claim_text: str, evidence_ids: list, batch_size: int = 16) -> list:
         """
@@ -211,7 +267,7 @@ class DistilBertReranker:
         self,
         claims: dict,
         evidence: dict,
-        num_negatives: int = 200
+        num_negatives: int = 50
     ):
         pairs = []
 
@@ -239,7 +295,11 @@ class DistilBertReranker:
                 if eid not in gold_ids
             ]
 
-            negative_ids = negative_ids[:num_negatives]
+            # randomly sample negatives
+            negative_ids = random.sample(
+                negative_ids,
+                min(num_negatives, len(negative_ids))
+            )
 
             for eid in negative_ids:
                 pairs.append({
@@ -271,14 +331,14 @@ class DistilBertReranker:
             train_pairs: list[dict] = self._build_ranker_pairs(
                 train_claims,
                 self.evidence,
-                num_negatives=200
+                num_negatives=self.negative_sample_size
             )
 
             # split the data into train and dev
             train_pairs, val_pairs = train_test_split(
                 train_pairs, # split the train pairs into train and val
                 test_size=0.15,  # 15% of the data for validation
-                random_state=42, # set the random state for reproducibility
+                random_state=34, # set the random state for reproducibility
                 stratify=[p["label"] for p in train_pairs] # stratify the data by the label to deal with class imbalance
             )
 
