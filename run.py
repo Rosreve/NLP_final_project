@@ -82,7 +82,7 @@ def main():
     parser.add_argument(
         "--negative-sample-size",
         type=int,
-        default=1,
+        default=8,
         help="Number of negative samples to use for reranking.",
     )
     args = parser.parse_args()
