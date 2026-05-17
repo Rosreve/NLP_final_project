@@ -8,3 +8,8 @@ sentence-transformers
 torch
 transformers
 accelerate
+
+# usage: python -m venv .venv
+# source .venv/bin/activate   # Windows: .venv\Scripts\activate
+# pip install numpy scikit-learn tqdm matplotlib nltk sentence-transformers torch transformers accelerate joblib
+# or pip install -r requirements.txt

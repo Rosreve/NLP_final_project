@@ -8,34 +8,15 @@ from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     TrainingArguments,
-    Trainer,
     AutoConfig
 )
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-import numpy as np
-
+from transformers import Trainer
 
 from util import load_data
 from config import OUTPUT_PATH
-
-from joblib import Parallel, delayed
-
 import random
-
-
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-
-    predictions = np.argmax(logits, axis=-1)
-
-    accuracy = accuracy_score(labels, predictions)
-
-    return {
-        "accuracy": accuracy
-    }
-
 
 class DistilBertReranker:
     def __init__(self,
@@ -44,8 +25,8 @@ class DistilBertReranker:
                 device: str = None,
                 max_length: int = 256,
                 retreiver: TransformerRetreiver = None,
-                negative_sample_size: int = 50,
-                top_k: int = 3,
+                negative_sample_size: int = 1,
+                top_k: int = 5,
                 retrain: bool = False):
 
         self.evidence = evidence    
@@ -70,7 +51,8 @@ class DistilBertReranker:
             logging_steps=50, # log the training and evaluation metrics every 50 steps
             load_best_model_at_end=True, # load the best model at the end of the training
             metric_for_best_model="eval_loss", # use the evaluation loss as the metric for the best model
-            report_to="none" # don't report the training and evaluation metrics to the console
+            report_to="none", # don't report the training and evaluation metrics to the console
+            remove_unused_columns=False # don't remove unused columns from the dataset
         )
 
         self.model = None
@@ -86,7 +68,7 @@ class DistilBertReranker:
             # load the model and tokenizer
             config = AutoConfig.from_pretrained(
                 self.model_name,
-                num_labels=2,
+                num_labels=1,
                 dropout=0.1,
                 attention_dropout=0.1
             )
@@ -98,12 +80,11 @@ class DistilBertReranker:
             train_dataset, val_dataset = self._load_data_for_finetune()
 
             # prepare the trainer
-            trainer = Trainer(
+            trainer = PairwiseRankingTrainer(
                 model=self.model,
                 args=self.training_args,
                 train_dataset=train_dataset,
                 eval_dataset=val_dataset,
-                compute_metrics=compute_metrics
             )
 
             # start training
@@ -166,57 +147,16 @@ class DistilBertReranker:
             }
         return reranked_claims
 
-    def rerank(
-        self,
-        claim_text: str,
-        candidate_ids: list,
-        threshold: float = 0.5, # threshold for the confidence score to be considered as positive
-        fallback_top_k: int = 1
-    ) -> list:
-        """
-        Return all evidence IDs that the reranker predicts as positive.
-        If none are predicted positive, return the top fallback_top_k evidence(s).
-        """
+    def rerank(self, claim_text: str, candidate_ids: list) -> list:
+        scores = self._score_pairs(claim_text, candidate_ids)
 
-        scores: list[float] = self._score_pairs(claim_text, candidate_ids)
-
-        ranked: list[tuple[str, float]] = sorted(
+        ranked = sorted(
             zip(candidate_ids, scores),
             key=lambda x: x[1],
             reverse=True
         )
 
-        positive_ids = [
-            eid for eid, score in ranked
-            if score >= threshold
-        ]
-
-        if len(positive_ids) == 0:
-            return [eid for eid, score in ranked[:fallback_top_k]] # to ensure at least fallback_top_k evidence(s) are returned
-
-        return positive_ids
-    # def rerank(self, claim_text: str, candidate_ids: list) -> list:
-    #     """
-    #     Rerank a list of evidence IDs for a given claim text.
-    #     args:
-    #         claim_text (str): The text of the claim for which we want to rerank the evidence IDs.
-    #         candidate_ids (list): The list of evidence IDs to rerank.
-    #         top_k (int): The number of top evidence IDs to return.
-    #     returns:
-    #         List of reranked evidence IDs.
-    #     """
-    #     # score the evidence pairs
-    #     scores: list[float] = self._score_pairs(claim_text, candidate_ids)
-
-    #     # sort the evidence pairs by the scores
-    #     ranked: list[tuple[str, float]] = sorted(
-    #         zip(candidate_ids, scores),
-    #         key=lambda x: x[1],
-    #         reverse=True # sort in descending order of scores
-    #     )
-        
-    #     # return the top k evidence IDs
-    #     return [eid for eid, score in ranked[:self.top_k]]
+        return [eid for eid, score in ranked[:self.top_k]]
 
     def _score_pairs(self, claim_text: str, evidence_ids: list, batch_size: int = 16) -> list:
         """
@@ -253,62 +193,57 @@ class DistilBertReranker:
             # start inference
             with torch.no_grad():
                 outputs = self.model(**encoded)
-                probs = torch.softmax(outputs.logits, dim=1)
 
             # get the scores for the relevant evidence pairs
-            relevant_scores: np.ndarray = probs[:, 1].detach().cpu().numpy()
+            relevant_scores = outputs.logits.squeeze(-1).detach().cpu().numpy()
             
             # extend the scores list with the relevant scores
             scores.extend(relevant_scores.tolist())
 
         return scores
 
-    def _build_ranker_pairs(
+    def _build_ranker_triplets(
         self,
         claims: dict,
         evidence: dict,
-        num_negatives: int = 50
+        num_negatives_per_positive: int = 1
     ):
-        pairs = []
+        triplets = []
 
-        for claim_id, claim_data in tqdm(claims.items(), desc="Building ranker pairs for finetuning"):
+        for claim_id, claim_data in tqdm(claims.items(), desc="Building ranking triplets"):
             claim_text = claim_data["claim_text"]
-            gold_ids = set(claim_data["evidences"])
-
-            # positive examples
-            for eid in gold_ids:
-                if eid in evidence:
-                    pairs.append({
-                        "claim": claim_text,
-                        "evidence": evidence[eid],
-                        "label": 1
-                    })
-
-            # hard negative examples from retreiver
-            retreived_ids, _ = self.retreiver.retreive(claim_text, top_k=340)
-
-            # get the negative evidence ids
-            # we sample the top consine similarity instances that are not in the gold set, as the "hard" negative examples
-            # in hope that algorithm to learn better than pure random sampling
-            negative_ids = [
-                eid for eid in retreived_ids
-                if eid not in gold_ids
+            gold_ids = [
+                eid for eid in claim_data["evidences"]
+                if eid in evidence
             ]
 
-            # randomly sample negatives
-            negative_ids = random.sample(
-                negative_ids,
-                min(num_negatives, len(negative_ids))
-            )
+            if len(gold_ids) == 0:
+                continue
 
-            for eid in negative_ids:
-                pairs.append({
-                    "claim": claim_text,
-                    "evidence": evidence[eid],
-                    "label": 0
-                })
+            retrieved_ids, _ = self.retreiver.retreive(claim_text, top_k=340)
 
-        return pairs
+            negative_ids = [
+                eid for eid in retrieved_ids
+                if eid not in set(gold_ids) and eid in evidence
+            ]
+
+            if len(negative_ids) == 0:
+                continue
+
+            for pos_id in gold_ids:
+                sampled_negatives = random.sample(
+                    negative_ids,
+                    min(num_negatives_per_positive, len(negative_ids))
+                )
+
+                for neg_id in sampled_negatives:
+                    triplets.append({
+                        "claim": claim_text,
+                        "positive_evidence": evidence[pos_id],
+                        "negative_evidence": evidence[neg_id],
+                    })
+
+        return triplets
 
     def _load_data_for_finetune(self):
         """
@@ -324,31 +259,53 @@ class DistilBertReranker:
             print("Loaded train and val datasets from cache.")
         except FileNotFoundError:
             print("No train and val datasets found in cache. Building from scratch.")
-
             train_claims, _, _ = load_data()
 
-            # build the ranker pairs
-            train_pairs: list[dict] = self._build_ranker_pairs(
-                train_claims,
+            claim_ids = list(train_claims.keys())
+
+            train_claim_ids, val_claim_ids = train_test_split(
+                claim_ids,
+                test_size=0.15,
+                random_state=42,
+                shuffle=True
+            )
+
+            train_claims_split = {
+                cid: train_claims[cid]
+                for cid in train_claim_ids
+            }
+
+            val_claims_split = {
+                cid: train_claims[cid]
+                for cid in val_claim_ids
+            }
+
+            train_triplets = self._build_ranker_triplets(
+                train_claims_split,
                 self.evidence,
-                num_negatives=self.negative_sample_size
+                num_negatives_per_positive=self.negative_sample_size
             )
 
-            # split the data into train and dev
-            train_pairs, val_pairs = train_test_split(
-                train_pairs, # split the train pairs into train and val
-                test_size=0.15,  # 15% of the data for validation
-                random_state=34, # set the random state for reproducibility
-                stratify=[p["label"] for p in train_pairs] # stratify the data by the label to deal with class imbalance
+            val_triplets = self._build_ranker_triplets(
+                val_claims_split,
+                self.evidence,
+                num_negatives_per_positive=self.negative_sample_size
             )
 
-            print(f"Number of train pairs: {len(train_pairs)}")
-            print(f"Number of val pairs: {len(val_pairs)}")
+            random.shuffle(train_triplets)
+            random.shuffle(val_triplets)
 
-            # prepare the datasets
-            train_dataset: RankerDataset = RankerDataset(train_pairs, self.tokenizer, self.max_length) # train dataset
-            val_dataset: RankerDataset = RankerDataset(val_pairs, self.tokenizer, self.max_length) # validation dataset
+            train_dataset = PairwiseRankerDataset(
+                train_triplets,
+                self.tokenizer,
+                self.max_length
+            )
 
+            val_dataset = PairwiseRankerDataset(
+                val_triplets,
+                self.tokenizer,
+                self.max_length
+            )
             self.save_dataset(train_dataset, val_dataset)
 
         return train_dataset, val_dataset
@@ -373,33 +330,77 @@ class DistilBertReranker:
         print(f"Loaded val dataset from {path}")
         return train_dataset, val_dataset
 
-class RankerDataset(Dataset):
-    # dataset for the ranker model
-    def __init__(self, pairs: list, tokenizer: AutoTokenizer, max_length: int = 256):
-        self.pairs = pairs
+class PairwiseRankerDataset(Dataset):
+    def __init__(self, triplets: list, tokenizer: AutoTokenizer, max_length: int = 256):
+        self.triplets = triplets
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.triplets)
 
     def __getitem__(self, idx):
-        item = self.pairs[idx]
+        item = self.triplets[idx]
 
-        # tokenize the claim and evidence
-        encoded: dict = self.tokenizer(
-            item["claim"], # claim text
-            item["evidence"], # evidence text
-            truncation=True, # truncate the text to the max length
-            padding="max_length", # pad the text to the max length
-            max_length=self.max_length, # set the max length
-            return_tensors="pt" # return the tensors 
+        pos_encoded = self.tokenizer(
+            item["claim"],
+            item["positive_evidence"],
+            truncation=True,
+            padding="max_length",
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+
+        neg_encoded = self.tokenizer(
+            item["claim"],
+            item["negative_evidence"],
+            truncation=True,
+            padding="max_length",
+            max_length=self.max_length,
+            return_tensors="pt"
         )
 
         return {
-            "input_ids": encoded["input_ids"].squeeze(0), # squeeze the tensor to reduce the batch dimension
-            # attension mask is used to mask the padding tokens to tell model which tokens are padded
-            "attention_mask": encoded["attention_mask"].squeeze(0), # squeeze the tensor to reduce the batch dimension
-            "labels": torch.tensor(item["label"], dtype=torch.long) # convert the label to a tensor for the loss function
+            "pos_input_ids": pos_encoded["input_ids"].squeeze(0),
+            "pos_attention_mask": pos_encoded["attention_mask"].squeeze(0),
+            "neg_input_ids": neg_encoded["input_ids"].squeeze(0),
+            "neg_attention_mask": neg_encoded["attention_mask"].squeeze(0),
         }
  
+class PairwiseRankingTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        pos_inputs = {
+            "input_ids": inputs["pos_input_ids"],
+            "attention_mask": inputs["pos_attention_mask"],
+        }
+
+        neg_inputs = {
+            "input_ids": inputs["neg_input_ids"],
+            "attention_mask": inputs["neg_attention_mask"],
+        }
+
+        pos_scores = model(**pos_inputs).logits.squeeze(-1)
+        neg_scores = model(**neg_inputs).logits.squeeze(-1)
+
+        margin = 1.0
+        loss = torch.relu(margin + neg_scores - pos_scores).mean()
+
+        if return_outputs:
+            return loss, {
+                "pos_scores": pos_scores,
+                "neg_scores": neg_scores,
+            }
+
+        return loss
+
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys=None
+    ):
+        with torch.no_grad():
+            loss = self.compute_loss(model, inputs)
+
+        return (loss, None, None)
